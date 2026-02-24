@@ -215,13 +215,23 @@ class TMDMAdapter(BaseAdapter):
 
         from model9_NS_transformer.exp.exp_main import Exp_Main
 
-        # We subclass at runtime so _get_data returns our loaders
+        # We subclass at runtime so _get_data returns our loaders and
+        # _build_model reuses the adapter's already-constructed models
+        # (avoids building 3 throwaway models in Exp_Basic.__init__).
         captured_loaders = loaders
         parent_device = self.device
+        adapter_diff_model = self.model
+        adapter_cond_model = self.cond_model
+        adapter_cond_model_train = self._cond_model_train or self._build_cond_model()
 
         class _PatchedExp(Exp_Main):
             def _acquire_device(self):  # type: ignore[override]
                 return parent_device
+
+            def _build_model(self):  # type: ignore[override]
+                return (adapter_diff_model,
+                        adapter_cond_model,
+                        adapter_cond_model_train)
 
             def _get_data(self, flag):  # type: ignore[override]
                 key = {"train": "train", "val": "val", "test": "test"}.get(flag, flag)
@@ -234,15 +244,18 @@ class TMDMAdapter(BaseAdapter):
         setting = "pifmdm"
         exp = _PatchedExp(self.args)
 
-        # Replace internal models with ours so weights are shared
-        exp.model = self.model
-        exp.cond_pred_model = self.cond_model
-
         exp.train(setting)
+
+        # After training, also save cond_pred_model (EarlyStopping only
+        # checkpoints the diffusion model in the original code)
+        cond_ckpt = os.path.join(save_dir, setting, "cond_pred_model.pth")
+        os.makedirs(os.path.dirname(cond_ckpt), exist_ok=True)
+        torch.save(exp.cond_pred_model.state_dict(), cond_ckpt)
 
         # Sync back: exp.train loads best checkpoint into exp.model
         self._model = exp.model
         self._cond_model = exp.cond_pred_model
+        self._cond_model_train = exp.cond_pred_model_train
 
     # -- native evaluation ------------------------------------------------
 

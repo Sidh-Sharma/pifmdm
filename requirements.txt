@@ -1,1 +1,14 @@
 # requirements.txt
+imageio==2.37.0
+linear_attention_transformer==0.19.1
+pot==0.9.5
+python_dateutil==2.9.0.post0
+pytorch_lightning==2.6.1
+PyYAML==6.0.2
+setuptools==75.8.0
+statsmodels==0.14.5
+torch==2.10.0
+torchcfm==1.0.7
+torchvision==0.25.0
+tqdm==4.67.1
+wget==3.2

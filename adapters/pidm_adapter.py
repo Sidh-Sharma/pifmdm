@@ -2,16 +2,22 @@
 PIDM adapter — thin pipeline wrapper around the Physics-Informed Diffusion Model.
 
 Data flow:
-    UnifiedDataset → prepare_native_loaders → (B, K, 1, L) image DataLoader
+    UnifiedDataset → prepare_native_loaders → (B, L, H, W) image DataLoader
     native_train   → replicates PIDM's main.py training loop faithfully:
                      Adam(lr=1e-4), grad_clip=1.0, cosine schedule, x0-prediction,
                      p2 loss weighting, EMA(0.99, start_iter=1000)
     native_evaluate → p_sample_loop from denoising_utils
     predict         → single-batch sampling for diagnostics
 
-PIDM natively works with 2-D spatial fields ``(B, C, H, W)``.  For time-series
-``(B, L, K)`` we treat data as ``(B, K, 1, L)`` — features on the channel axis,
-length on the W axis.
+PIDM natively works with 2-D spatial fields ``(B, C, H, W)``.  We exploit
+the fact that our spatial features *K* originate from an *H × W* grid and
+**unflatten** them back, placing the *L* temporal steps on the channel axis:
+
+    Unified ``(B, L, K)`` → ``(B, L, H, W)``  where ``K = H * W``
+
+This way the UNet's spatial convolutions operate on the **actual** spatial
+neighbours and each "channel" is one timestep.  The config must supply
+``spatial_shape: [H, W]`` so the adapter knows how to reshape.
 """
 
 from __future__ import annotations
@@ -45,7 +51,6 @@ _DEFAULT_PIDM_CONFIG: Dict[str, Any] = {
     "unet": {
         "dim": 64,
         "dim_mults": [1, 2, 4],
-        "channels": 1,
         "attn_heads": 4,
         "attn_dim_head": 32,
         "padding_mode": "zeros",
@@ -76,14 +81,19 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Bridge dataset: converts (L, K) time‐series into (K, 1, L) images.
+# Bridge dataset: converts (L, K) time‐series into (L, H, W) spatial images.
 # ---------------------------------------------------------------------------
 
 class _PIDMBridgeDataset(Dataset):
-    """Wraps unified items into ``(K, 1, L)`` image tensors for the UNet."""
+    """Wraps unified items into ``(L, H, W)`` image tensors for the UNet.
 
-    def __init__(self, unified_ds: Dataset):
+    *L* timesteps become image channels;  *K* features are unflattened
+    back to the original ``H × W`` spatial grid.
+    """
+
+    def __init__(self, unified_ds: Dataset, spatial_shape: tuple[int, int]):
         self.ds = unified_ds
+        self.H, self.W = spatial_shape
 
     def __len__(self):
         return len(self.ds)  # type: ignore[arg-type]
@@ -91,8 +101,9 @@ class _PIDMBridgeDataset(Dataset):
     def __getitem__(self, idx):
         item = self.ds[idx]
         data = item["observed_data"]  # (L, K)
-        # → (K, 1, L): channels = features, spatial = 1×L
-        return data.permute(1, 0).unsqueeze(1)  # (K, 1, L)
+        L, K = data.shape
+        # → (L, H, W): temporal channels, actual spatial grid
+        return data.view(L, self.H, self.W)  # (L, H, W)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +150,26 @@ class PIDMAdapter(BaseAdapter):
         self.pidm_config = _deep_merge(_DEFAULT_PIDM_CONFIG, config.get("pidm", {}))
         self.train_cfg = config.get("training", {})
 
+        # Spatial shape — required so we can unflatten K → (H, W)
+        sp = config.get("spatial_shape")
+        if sp is None:
+            # Fallback: assume square grid  (K must be a perfect square)
+            import math
+            side = int(math.isqrt(self.target_dim))
+            if side * side != self.target_dim:
+                raise ValueError(
+                    f"PIDM requires spatial_shape in config (target_dim={self.target_dim} "
+                    f"is not a perfect square)."
+                )
+            sp = [side, side]
+        self.spatial_shape: tuple[int, int] = (int(sp[0]), int(sp[1]))
+        H, W = self.spatial_shape
+        if H * W != self.target_dim:
+            raise ValueError(
+                f"spatial_shape {self.spatial_shape} does not match "
+                f"target_dim={self.target_dim} (H*W={H*W})."
+            )
+
     # -- model construction -----------------------------------------------
 
     @property
@@ -149,11 +180,13 @@ class PIDMAdapter(BaseAdapter):
         from src.unet_model import Unet3D
 
         ucfg = self.pidm_config["unet"]
+        # channels = L (temporal steps as image channels)
+        # spatial dims = H × W (actual spatial grid)
         return Unet3D(
             dim=ucfg["dim"],
-            out_dim=self.target_dim,
+            out_dim=self.seq_len,
             dim_mults=tuple(ucfg["dim_mults"]),
-            channels=self.target_dim,
+            channels=self.seq_len,
             attn_heads=ucfg.get("attn_heads", 4),
             attn_dim_head=ucfg.get("attn_dim_head", 32),
             padding_mode=ucfg.get("padding_mode", "zeros"),
@@ -168,17 +201,18 @@ class PIDMAdapter(BaseAdapter):
         test_ds: Dataset,
     ) -> Dict[str, Any]:
         bs = self.config.get("batch_size", 16)
+        sp = self.spatial_shape
         return {
             "train": DataLoader(
-                _PIDMBridgeDataset(train_ds), batch_size=bs,
+                _PIDMBridgeDataset(train_ds, sp), batch_size=bs,
                 shuffle=True, num_workers=0,
             ),
             "val": DataLoader(
-                _PIDMBridgeDataset(val_ds), batch_size=bs,
+                _PIDMBridgeDataset(val_ds, sp), batch_size=bs,
                 shuffle=False, num_workers=0,
             ),
             "test": DataLoader(
-                _PIDMBridgeDataset(test_ds), batch_size=bs,
+                _PIDMBridgeDataset(test_ds, sp), batch_size=bs,
                 shuffle=False, num_workers=0,
             ),
         }
@@ -260,37 +294,37 @@ class PIDMAdapter(BaseAdapter):
         model = self.model
         model.eval()
 
+        H, W = self.spatial_shape
+
         # Sample unconditionally and compare with test data
         all_samples, all_targets = [], []
         for batch_img in loaders["test"]:
-            batch_img = batch_img.to(self.device)  # (B, K, 1, L)
-            B, K, _, L = batch_img.shape
+            batch_img = batch_img.to(self.device)  # (B, L, H, W)
+            B, L = batch_img.shape[0], batch_img.shape[1]
 
             samples_batch = []
             for _ in range(n_samples):
-                sample_shape = (B, K, L)  # squeezed (PIDM uses H, W)
-                cur_x = torch.randn(B, K, 1, L, device=self.device)
+                cur_x = torch.randn(B, L, H, W, device=self.device)
                 for i in reversed(range(diff_steps)):
                     t = torch.full((B,), i, device=self.device, dtype=torch.long)
                     x0_pred = model(cur_x, t)
                     if x0_pred.dim() == 5:
                         x0_pred = x0_pred.squeeze(2)
-                    cur_x_sq = cur_x.squeeze(2)
                     from src.denoising_utils import extract
                     mean = (
-                        extract(diffusion.diff_dict["posterior_mean_coef1"], t, cur_x_sq) * x0_pred
-                        + extract(diffusion.diff_dict["posterior_mean_coef2"], t, cur_x_sq) * cur_x_sq
+                        extract(diffusion.diff_dict["posterior_mean_coef1"], t, cur_x) * x0_pred
+                        + extract(diffusion.diff_dict["posterior_mean_coef2"], t, cur_x) * cur_x
                     )
                     if i > 0:
-                        sigma = extract(diffusion.diff_dict["betas"], t, cur_x_sq).sqrt()
-                        cur_x = (mean + sigma * torch.randn_like(cur_x_sq)).unsqueeze(2)
+                        sigma = extract(diffusion.diff_dict["betas"], t, cur_x).sqrt()
+                        cur_x = mean + sigma * torch.randn_like(cur_x)
                     else:
-                        cur_x = mean.unsqueeze(2)
-                # cur_x: (B, K, 1, L) → (B, L, K)
-                samples_batch.append(cur_x.squeeze(2).permute(0, 2, 1).cpu())
+                        cur_x = mean
+                # cur_x: (B, L, H, W) → (B, L, K)
+                samples_batch.append(cur_x.view(B, L, -1).cpu())
 
             samples = torch.stack(samples_batch, dim=1)  # (B, N, L, K)
-            targets = batch_img.squeeze(2).permute(0, 2, 1).cpu()  # (B, L, K)
+            targets = batch_img.view(B, L, -1).cpu()     # (B, L, K)
             all_samples.append(samples)
             all_targets.append(targets)
 
@@ -316,8 +350,10 @@ class PIDMAdapter(BaseAdapter):
         self.model.eval()
         batch = batch.to(self.device)
 
-        data = batch.observed_data.permute(0, 2, 1).unsqueeze(2)  # (B, K, 1, L)
-        B, K, _, L = data.shape
+        B, L, K = batch.observed_data.shape
+        H, W = self.spatial_shape
+        # (B, L, K) → (B, L, H, W)
+        data = batch.observed_data.view(B, L, H, W)
 
         diff_steps = self.pidm_config["diff_steps"]
         diffusion = DenoisingDiffusion(diff_steps, self.device, residual_grad_guidance=False)
@@ -330,17 +366,17 @@ class PIDMAdapter(BaseAdapter):
                 x0_pred = self.model(cur_x, t)
                 if x0_pred.dim() == 5:
                     x0_pred = x0_pred.squeeze(2)
-                cur_x_sq = cur_x.squeeze(2)
                 mean = (
-                    extract(diffusion.diff_dict["posterior_mean_coef1"], t, cur_x_sq) * x0_pred
-                    + extract(diffusion.diff_dict["posterior_mean_coef2"], t, cur_x_sq) * cur_x_sq
+                    extract(diffusion.diff_dict["posterior_mean_coef1"], t, cur_x) * x0_pred
+                    + extract(diffusion.diff_dict["posterior_mean_coef2"], t, cur_x) * cur_x
                 )
                 if i > 0:
-                    sigma = extract(diffusion.diff_dict["betas"], t, cur_x_sq).sqrt()
-                    cur_x = (mean + sigma * torch.randn_like(cur_x_sq)).unsqueeze(2)
+                    sigma = extract(diffusion.diff_dict["betas"], t, cur_x).sqrt()
+                    cur_x = mean + sigma * torch.randn_like(cur_x)
                 else:
-                    cur_x = mean.unsqueeze(2)
-            all_samples.append(cur_x.squeeze(2).permute(0, 2, 1))  # (B, L, K)
+                    cur_x = mean
+            # (B, L, H, W) → (B, L, K)
+            all_samples.append(cur_x.view(B, L, K))
 
         samples = torch.stack(all_samples, dim=1)  # (B, N, L, K)
 
