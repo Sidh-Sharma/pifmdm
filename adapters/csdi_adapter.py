@@ -127,12 +127,12 @@ class CSDIAdapter(BaseAdapter):
         return super().model  # type: ignore[return-value]
 
     def build_model(self) -> nn.Module:
-        from main_model import CSDI_base
+        from main_model import CSDI_Physio
 
-        return CSDI_base(
-            target_dim=self.target_dim,
+        return CSDI_Physio(
             config=self.csdi_config,
             device=self.device,
+            target_dim=self.target_dim,
         )
 
     # -- data wrapping ---------------------------------------------------
@@ -165,7 +165,10 @@ class CSDIAdapter(BaseAdapter):
         os.makedirs(save_dir, exist_ok=True)
         from utils import train as csdi_train
 
-        csdi_cfg = {"epochs": self.train_cfg.get("epochs", 200)}
+        csdi_cfg = {
+            "epochs": self.train_cfg.get("epochs", 200),
+            "lr": self.train_cfg.get("lr", 1e-3),
+        }
         csdi_train(
             self.model,
             csdi_cfg,
