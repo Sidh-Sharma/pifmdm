@@ -168,6 +168,8 @@ class CSDIAdapter(BaseAdapter):
         csdi_cfg = {
             "epochs": self.train_cfg.get("epochs", 200),
             "lr": self.train_cfg.get("lr", 1e-3),
+            "itr_per_epoch": self.train_cfg.get("itr_per_epoch", 100),  
+            "valid_epoch_interval": self.train_cfg.get("valid_epoch_interval", 20)
         }
         csdi_train(
             self.model,

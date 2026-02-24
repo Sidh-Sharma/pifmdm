@@ -16,7 +16,7 @@ data:
   #   2 → 32×32 = 1024 features
   #   4 → 16×16 = 256  features
   #   8 →  8×8  = 64   features  (reasonable for CSDI attention)
-  spatial_stride: 8
+  spatial_stride: 1
 
   # Temporal subsampling: keep every n-th timestep
   temporal_stride: 1
