@@ -1,0 +1,81 @@
+# TMDM on 2D linear advection
+#
+# Usage:
+#   python scripts/run_experiment.py --model tmdm --config configs/experiment/tmdm_advection.yaml --device auto
+#
+# NOTE: TMDM is a *forecasting* model.  It splits each window into an
+# encoder prefix (seq_len) and a decoder prediction horizon (pred_len).
+# Make sure seq_len + pred_len <= window_size.
+
+# --- Data loading ---------------------------------------------------------
+data:
+  type: advection
+  path: datasets/synthetic/advection_data_2d.npy
+  spatial_stride: 8          # 8×8 = 64 features
+  temporal_stride: 1
+  window_size: 64            # total timesteps per sample
+  window_stride: 8
+  normalise: true
+  miss_ratio: 0.1
+  mask_strategy: future      # mask the prediction horizon
+
+# --- Dimensions -----------------------------------------------------------
+seq_len: 48                  # encoder input length  (must be < window_size)
+batch_size: 32
+
+# --- TMDM model config ---------------------------------------------------
+tmdm:
+  # Sequence split
+  seq_len: 48
+  label_len: 24              # overlap between encoder and decoder
+  pred_len: 16               # prediction horizon (48 + 16 = 64 = window_size)
+  # NS-Transformer (conditional predictor)
+  d_model: 256               # smaller than default 512 — 64 features is modest
+  n_heads: 8
+  e_layers: 2
+  d_layers: 1
+  d_ff: 512
+  factor: 3
+  dropout: 0.05
+  activation: gelu
+  embed: timeF
+  freq: h
+  output_attention: false
+  # VAE
+  k_z: 0.01
+  k_cond: 1.0
+  d_z: 8
+  # Projector
+  p_hidden_dims: [64, 64]
+  p_hidden_layers: 2
+  # Diffusion
+  timesteps: 200             # fewer diffusion steps for faster training
+  CART_input_x_embed_dim: 32
+  # Training
+  learning_rate: 0.0001
+  learning_rate_Cond: 0.0001
+  train_epochs: 200
+  patience: 15
+  batch_size: 32
+  test_batch_size: 8
+
+# --- Training -------------------------------------------------------------
+training:
+  save_dir: results/checkpoints/tmdm_advection
+
+# --- Evaluation -----------------------------------------------------------
+evaluation:
+  n_samples: 10
+  save_dir: results/metrics/tmdm_advection
+
+# --- Diagnostics ----------------------------------------------------------
+diagnostics:
+  semigroup:
+    t1: 12
+    t2: 12
+  conservation: true
+  horizon:
+    horizons: [4, 8, 12, 16]
+    context_len: 16
+  sparsity:
+    miss_ratios: [0.1, 0.2, 0.3, 0.5, 0.7]

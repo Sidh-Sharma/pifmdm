@@ -1,0 +1,73 @@
+# CFMI on 2D linear advection
+#
+# Usage:
+#   python scripts/run_experiment.py --model cfmi --config configs/experiment/cfmi_advection.yaml --device auto
+
+# --- Data loading ---------------------------------------------------------
+data:
+  type: advection
+  path: datasets/synthetic/advection_data_2d.npy
+  spatial_stride: 8          # 8×8 = 64 features
+  temporal_stride: 1
+  window_size: 64
+  window_stride: 8
+  normalise: true
+  miss_ratio: 0.1
+  mask_strategy: random
+
+# --- Dimensions -----------------------------------------------------------
+seq_len: 64
+batch_size: 16               # CFMI default for timeseries
+
+# --- CFMI model config ----------------------------------------------------
+cfmi:
+  vector_field:
+    type: tashiro             # CSDI-style attention backbone
+    channels: 64
+    emb_time_dim: 128
+    feature_id_emb_dim: 16
+    embedding_dim: 128
+    nheads: 8
+    layers: 4
+    is_linear: false
+  time_embedding:
+    embedding_dim: 128
+    frequency_multiplier: 50
+  flow_matcher:
+    sigma: 0.0
+  mask_generator:
+    type: uniform_random
+    target_probability: null   # learnable masking
+  solver:
+    type: euler               # euler | midpoint | dopri45 | rk4
+    num_t: 101
+  opt_lr: 0.001
+  opt_weight_decay: 0.000001
+  # PyTorch Lightning Trainer settings
+  trainer:
+    max_epochs: 200
+    accelerator: auto         # GPU support handled by Lightning
+    devices: 1
+    gradient_clip_val: null
+
+# --- Training -------------------------------------------------------------
+training:
+  epochs: 200                 # passed to trainer.max_epochs
+  save_dir: results/checkpoints/cfmi_advection
+
+# --- Evaluation -----------------------------------------------------------
+evaluation:
+  n_samples: 10
+  save_dir: results/metrics/cfmi_advection
+
+# --- Diagnostics ----------------------------------------------------------
+diagnostics:
+  semigroup:
+    t1: 16
+    t2: 16
+  conservation: true
+  horizon:
+    horizons: [8, 16, 32, 48]
+    context_len: 16
+  sparsity:
+    miss_ratios: [0.1, 0.2, 0.3, 0.5, 0.7]

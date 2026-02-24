@@ -1,0 +1,42 @@
+# Example experiment config for CSDI imputation
+#
+# Usage:
+#   python scripts/run_experiment.py --model csdi --config configs/experiment/csdi_example.yaml
+
+target_dim: 7       # number of features K
+seq_len: 96         # sequence length L
+batch_size: 32
+
+data:
+  # path: datasets/era5/processed.npy   # uncomment when real data is available
+  n_samples: 512     # used for demo random data when path is not set
+  seq_len: 96
+  target_dim: 7
+  miss_ratio: 0.1
+  mask_strategy: random   # "random" or "future"
+
+# Model-specific overrides (nested under the model name)
+csdi:
+  diffusion:
+    layers: 4
+    channels: 64
+    nheads: 8
+    num_steps: 50
+    schedule: quad
+    beta_start: 0.0001
+    beta_end: 0.5
+  model:
+    is_unconditional: false
+    timeemb: 128
+    featureemb: 16
+    target_strategy: random
+
+training:
+  epochs: 50
+  lr: 0.001
+  patience: 10
+  save_dir: results/checkpoints/csdi
+
+evaluation:
+  n_samples: 10
+  save_dir: results/metrics/csdi
